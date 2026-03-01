@@ -1,0 +1,164 @@
+# =============================================================================
+# OpenDDIL Regional Stack — Forward Operating Base
+# =============================================================================
+# Tiered Hub-and-Spoke architecture. This regional hub:
+#   1. Holds a SUBSET of HQ data (row-filtered Postgres logical replication)
+#   2. Buffers Edge writes via a Regional Redpanda broker
+#   3. Bridges events to HQ via Redpanda Connect (open-source Benthos)
+#   4. Runs ElectricSQL to sync Regional Postgres → Edge devices
+#
+# ⚠️  Restate ONLY runs at HQ — NOT here. This prevents split-brain processing.
+#     Regional hubs are data proxies and event buffers, not processors.
+#
+# 🔓 100% open-source. No enterprise-licensed features.
+#    Redpanda Connect replaces MirrorMaker 2 / Cluster Linking.
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Regional PostgreSQL
+  # ---------------------------------------------------------------------------
+  # Holds a row-filtered subset of HQ data (e.g., WHERE region = 'EU').
+  # Subscribes to HQ Postgres via logical replication.
+  # ElectricSQL reads from this instance to serve Edge clients.
+  # ---------------------------------------------------------------------------
+  regional-postgres:
+    image: postgres:16-alpine
+    container_name: openddil-regional-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openddil_regional
+      POSTGRES_USER: openddil
+      POSTGRES_PASSWORD: openddil
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=10"
+      - "-c"
+      - "max_wal_senders=10"
+    ports:
+      - "5433:5432"
+    volumes:
+      - regional_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openddil -d openddil_regional"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - openddil-regional
+
+  # ---------------------------------------------------------------------------
+  # Regional Redpanda (Kafka-compatible)
+  # ---------------------------------------------------------------------------
+  # Receives events from Edge Relay agents in this region.
+  # Redpanda Connect reads from here and pushes events to HQ Redpanda.
+  # Events are processed ONLY at HQ by Restate — never locally.
+  # ---------------------------------------------------------------------------
+  regional-redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.1.1
+    container_name: openddil-regional-redpanda
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --mode dev-container
+      - --smp 1
+      - --memory 512M
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://regional-redpanda:9092,external://localhost:19092
+      - --schema-registry-addr internal://0.0.0.0:8081,external://0.0.0.0:18081
+    ports:
+      - "19092:19092"
+      - "18081:18081"
+    volumes:
+      - regional_rpdata:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--api-urls", "localhost:9644"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - openddil-regional
+
+  # ---------------------------------------------------------------------------
+  # Regional Redpanda Console
+  # ---------------------------------------------------------------------------
+  regional-redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.6.0
+    container_name: openddil-regional-console
+    restart: unless-stopped
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["regional-redpanda:9092"]
+          schemaRegistry:
+            enabled: true
+            urls: ["http://regional-redpanda:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://regional-redpanda:9644"]
+    ports:
+      - "8081:8080"
+    depends_on:
+      regional-redpanda:
+        condition: service_healthy
+    networks:
+      - openddil-regional
+
+  # ---------------------------------------------------------------------------
+  # Regional ElectricSQL
+  # ---------------------------------------------------------------------------
+  # Syncs Regional Postgres → local SQLite read-cache on Edge devices.
+  # Edge clients in this region connect HERE, not to HQ's ElectricSQL.
+  # ---------------------------------------------------------------------------
+  regional-electric:
+    image: electricsql/electric:0.9
+    container_name: openddil-regional-electric
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: "postgresql://openddil:openddil@regional-postgres:5432/openddil_regional"
+    ports:
+      - "3001:3000"
+    depends_on:
+      regional-postgres:
+        condition: service_healthy
+    networks:
+      - openddil-regional
+
+  # ---------------------------------------------------------------------------
+  # Redpanda Connect (Benthos) — Open-Source Event Bridge
+  # ---------------------------------------------------------------------------
+  # Reads events from the Regional Redpanda topic and pushes them to HQ.
+  # Replaces MirrorMaker 2 / Cluster Linking with a 100% open-source solution.
+  #
+  # Why Redpanda Connect for DDIL:
+  #   - Built-in retry with exponential backoff for intermittent uplinks
+  #   - Handles backpressure gracefully (doesn't overflow buffers)
+  #   - Automatically flushes backlog when uplink reconnects
+  #   - Consumer offsets ensure at-least-once delivery (Restate handles dedup)
+  # ---------------------------------------------------------------------------
+  redpanda-connect:
+    image: docker.redpanda.com/redpandadata/connect:latest
+    container_name: openddil-regional-connect
+    restart: unless-stopped
+    volumes:
+      - ./connect/redpanda-connect.yaml:/connect.yaml:ro
+    command: ["run", "/connect.yaml"]
+    depends_on:
+      regional-redpanda:
+        condition: service_healthy
+    networks:
+      - openddil-regional
+
+volumes:
+  regional_pgdata:
+  regional_rpdata:
+
+networks:
+  openddil-regional:
+    driver: bridge

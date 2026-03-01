@@ -1,0 +1,39 @@
+# =============================================================================
+# OpenDDIL Regional Stack — Cursor Rules
+# =============================================================================
+
+# Project Identity
+You are working in the openddil-regional-stack repository — the Regional Hub
+infrastructure for the OpenDDIL Tiered Hub-and-Spoke architecture.
+
+# CRITICAL: No Restate Here
+Restate ONLY runs at HQ. NEVER add a Restate service to this Docker Compose.
+Regional hubs are data proxies and event buffers — NOT event processors.
+
+# CRITICAL: Open-Source Only
+This stack uses Redpanda Connect (Benthos) for event bridging.
+NEVER use MirrorMaker 2, Cluster Linking, or any enterprise-licensed feature.
+
+# Tech Stack
+- PostgreSQL 16-alpine (wal_level=logical for ElectricSQL and replication)
+- Redpanda (Kafka-compatible, dev-container mode)
+- ElectricSQL 0.9+ (Shape API for read sync to Edge)
+- Redpanda Connect (formerly Benthos — open-source event bridge)
+
+# Port Convention
+All Regional ports are OFFSET from HQ:
+- Postgres: 5433, Redpanda: 19092, Console: 8081, ElectricSQL: 3001
+
+# Redpanda Connect Config Rules
+- Config lives in connect/redpanda-connect.yaml.
+- Input: kafka_franz from Regional Redpanda.
+- Output: kafka_franz to HQ Redpanda.
+- Pipeline: pass-through (no transformation — raw Protobuf bytes).
+- ALWAYS use Zstd compression on the output.
+- ALWAYS use idempotent_write: true.
+- HQ broker address should use environment variable: ${HQ_REDPANDA_BROKERS}.
+
+# Replication Rules
+- HQ → Regional: Postgres logical replication with WHERE (region = 'REGION_CODE')
+- Regional Postgres is READ-ONLY for replicated data.
+- Regional → HQ: Redpanda Connect bridges events (not Postgres replication).

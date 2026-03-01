@@ -1,0 +1,30 @@
+# OpenDDIL Regional Stack — llms.txt
+# https://llmstxt.org/
+
+> OpenDDIL Regional Stack provides a Forward Operating Base for the Tiered
+> Hub-and-Spoke architecture. Uses Redpanda Connect (open-source Benthos)
+> to bridge events to HQ. 100% open-source, no enterprise licensing.
+
+## CRITICAL: Restate Only at HQ
+Restate does NOT run at the Regional level. This prevents split-brain processing.
+Regional hubs are data proxies and event buffers only.
+
+## Architecture
+- Read Path: HQ Postgres → Logical Replication WHERE (region='EU') → Regional Postgres → ElectricSQL → Edge
+- Write Path: Edge Relay → Regional Redpanda → Redpanda Connect → HQ Redpanda → Restate
+- Bridge: Redpanda Connect (kafka_franz input→output) with DDIL backoff and Zstd compression
+- Autonomous: Hub operates independently when disconnected; flushes backlog on reconnect
+
+## Key Files
+- docker-compose.yml: Regional Postgres, Redpanda, Console, ElectricSQL, Redpanda Connect.
+- connect/redpanda-connect.yaml: kafka_franz bridge config with retry/backoff.
+- replication/hq_to_regional.sql: Postgres logical replication with row filtering.
+
+## Port Offsets
+- Postgres: 5433, Redpanda: 19092, Console: 8081, ElectricSQL: 3001, Connect Health: 4195
+
+## Why Redpanda Connect (not MirrorMaker 2)
+- Apache 2.0 licensed (no enterprise features required)
+- Single YAML config vs complex connector properties
+- Built-in backpressure and DDIL-resilient retry
+- Lightweight single binary (no JVM overhead)

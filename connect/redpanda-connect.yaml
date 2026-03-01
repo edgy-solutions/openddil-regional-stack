@@ -1,0 +1,104 @@
+# =============================================================================
+# OpenDDIL — Redpanda Connect Configuration (Regional → HQ Bridge)
+# =============================================================================
+# Open-source event bridge using Redpanda Connect (formerly Benthos).
+# Reads from the Regional Redpanda topic and pushes events to HQ Redpanda.
+#
+# This replaces MirrorMaker 2 / Cluster Linking with a 100% open-source,
+# license-free solution that is purpose-built for DDIL environments:
+#
+#   - Exponential backoff on uplink failures (handles "Intermittent" in DDIL)
+#   - Automatic backlog flush when connectivity is restored
+#   - Backpressure handling (doesn't overflow when HQ is unreachable)
+#   - At-least-once delivery (Restate's exactly-once handles dedup at HQ)
+#
+# ⚠️  Events are processed ONLY at HQ by Restate. This bridge is a dumb pipe.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Input: Read from Regional Redpanda
+# ---------------------------------------------------------------------------
+# kafka_franz provides a modern, high-performance Kafka client.
+# Consumer group tracks offsets — events are not re-sent after Redpanda
+# Connect restarts (unless they were never committed upstream).
+# ---------------------------------------------------------------------------
+input:
+  kafka_franz:
+    seed_brokers:
+      - "regional-redpanda:9092"
+    topics:
+      - "inventory-commands"
+    consumer_group: "openddil-regional-bridge"
+    # Start from the earliest unprocessed message on first boot.
+    # Ensures no events are missed even if the bridge starts after
+    # Edge devices have already flushed events to Regional Redpanda.
+    start_from_oldest: true
+
+# ---------------------------------------------------------------------------
+# Pipeline: Pass-through (no transformation)
+# ---------------------------------------------------------------------------
+# Events are raw Protobuf bytes — CloudEvent envelopes produced by the
+# Edge Relay agents. No transformation needed; HQ's Restate processor
+# deserializes them directly.
+# ---------------------------------------------------------------------------
+pipeline:
+  processors: []
+
+# ---------------------------------------------------------------------------
+# Output: Push to HQ Redpanda
+# ---------------------------------------------------------------------------
+# kafka_franz output with aggressive retry and backoff for DDIL resilience.
+# The Regional hub may be disconnected from HQ for hours or days.
+# Redpanda Connect will keep retrying and automatically flush the entire
+# backlog the moment the uplink returns.
+# ---------------------------------------------------------------------------
+output:
+  kafka_franz:
+    seed_brokers:
+      # For local Docker development, use host.docker.internal to reach HQ.
+      # In production, set this to the actual HQ Redpanda broker address.
+      - "${HQ_REDPANDA_BROKERS:-host.docker.internal:9092}"
+    topic: "inventory-commands"
+    # Preserve the message key from the Regional topic (event ID).
+    # This ensures consistent partitioning at HQ.
+    key: ${! meta("kafka_key") }
+    # Compression for bandwidth-constrained DDIL links
+    compression: zstd
+    # Idempotent producer to avoid duplicates on retry
+    idempotent_write: true
+    # Maximum number of in-flight requests (1 = strict ordering)
+    max_in_flight: 1
+    # Retry configuration for intermittent uplink failures
+    retry_as_batch: true
+    batching:
+      count: 100
+      period: "2s"
+      processors: []
+    metadata:
+      include_patterns:
+        - ".*"
+
+# ---------------------------------------------------------------------------
+# Error Handling & Backoff (DDIL Resilience)
+# ---------------------------------------------------------------------------
+# When HQ is unreachable, Redpanda Connect retries with exponential backoff.
+# This is the critical DDIL feature — the bridge gracefully handles:
+#   - Complete uplink loss (Denied)
+#   - Slow/degraded connections (Degraded)
+#   - Intermittent connectivity (Intermittent)
+#   - Limited bandwidth (Limited — Zstd compression helps)
+# ---------------------------------------------------------------------------
+
+# Logger configuration
+logger:
+  level: INFO
+  format: logfmt
+
+# Metrics (optional, for monitoring bridge health)
+metrics:
+  prometheus: {}
+
+# HTTP API for health checks and debugging
+http:
+  address: "0.0.0.0:4195"
+  enabled: true
